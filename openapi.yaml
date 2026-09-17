@@ -1,0 +1,707 @@
+openapi: 3.0.3
+info:
+  title: resume-tailor-api
+  version: 1.0.0
+  license:
+    name: UNLICENSED
+  description: |
+    Backend API for resume-tailor: accepts a resume file (PDF/DOCX) and a job
+    description, extracts structured data, calls an LLM to tailor the resume
+    against the job description under strict anti-fabrication guardrails, and
+    returns per-section diffs, ATS scores, and export-ready PDF/DOCX files.
+
+    ## Authentication
+    All endpoints except `/auth/register`, `/auth/login`, `/auth/refresh`, and
+    `/health` require a JWT access token via `Authorization: Bearer <token>`.
+    Access tokens are short-lived; use `/auth/refresh` with the refresh token
+    to get a new pair (refresh tokens rotate — each refresh invalidates the
+    previous refresh token).
+
+    ## Error shape
+    Every error response has this shape:
+    ```json
+    { "error": { "code": "SOME_CODE", "message": "Human readable", "details": {} } }
+    ```
+
+    ## The anti-fabrication guardrail
+    `POST /tailoring` never asks the LLM to reproduce company names, job
+    titles, dates, or education — only summary text, per-bullet rewrites, and
+    a skills selection. Every suggested bullet/summary is additionally
+    fact-checked against the original resume text before being applied; any
+    suggestion that introduces a tool, employer, number, or achievement not
+    already present in the source resume is reverted and marked
+    `flagged_invented` in `perBulletDiffs`, never appearing in
+    `tailoredSections`.
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Health
+    description: Service liveness check.
+  - name: Auth
+    description: Registration, login, and JWT refresh.
+  - name: Resumes
+    description: Resume upload, parsing, and manual corrections.
+  - name: Job Descriptions
+    description: Job description submission and keyword/requirement extraction.
+  - name: Tailoring
+    description: LLM-assisted tailoring of a resume to a job description, with guardrail-validated diffs, ATS scoring, acceptance, and export.
+  - name: History
+    description: Past tailoring jobs for the current user.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  uptime: { type: number, description: Process uptime in seconds }
+                  timestamp: { type: string, format: date-time }
+                required: [status, uptime, timestamp]
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Register a new account
+      security: []
+      description: Rate limited to 20 requests per 15 minutes per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: Email already registered (`AUTH_EMAIL_TAKEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginUser
+      summary: Log in with email and password
+      security: []
+      description: Rate limited to 20 requests per 15 minutes per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Invalid email or password (`AUTH_INVALID_CREDENTIALS`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new access/refresh pair
+      security: []
+      description: |
+        Rotates the refresh token — the one submitted here is invalidated and
+        a new one is returned. Reusing an already-rotated (or expired/unknown)
+        refresh token fails with 401. Rate limited to 20 requests per 15
+        minutes per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Invalid, expired, or already-rotated refresh token (`AUTH_INVALID_REFRESH_TOKEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /resumes:
+    post:
+      tags: [Resumes]
+      operationId: uploadResume
+      summary: Upload a resume (PDF or DOCX) for parsing
+      description: |
+        The file is validated by magic bytes (not just its extension/MIME
+        type), capped at 5MB, encrypted at rest, and parsed into structured
+        JSON with a heuristic (non-LLM) parser. Parsing is best-effort — use
+        `PATCH /resumes/{id}` to correct any misparsed field.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PDF or DOCX file, max 5MB
+      responses:
+        '201':
+          description: Resume uploaded and parsed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Resume' }
+        '400':
+          description: |
+            Missing file (`RESUME_FILE_REQUIRED`), wrong type
+            (`RESUME_INVALID_FILE_TYPE`), too large (`RESUME_FILE_TOO_LARGE`),
+            or another upload error (`RESUME_UPLOAD_ERROR`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422':
+          description: The file's text could not be extracted (`RESUME_PARSE_FAILED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /resumes/{id}:
+    patch:
+      tags: [Resumes]
+      operationId: patchResume
+      summary: Correct one or more parsed resume fields
+      parameters:
+        - $ref: '#/components/parameters/ResumeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchResumeRequest' }
+      responses:
+        '200':
+          description: Updated resume
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Resume' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The resume belongs to another user (`RESUME_FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Resume not found (`RESUME_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /job-descriptions:
+    post:
+      tags: [Job Descriptions]
+      operationId: createJobDescription
+      summary: Submit a job description for keyword/requirement extraction
+      description: Extraction is deterministic (no LLM involved) — see the Build Log for the heuristic used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJobDescriptionRequest' }
+      responses:
+        '201':
+          description: Job description created with extracted keywords/requirements
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobDescription' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /tailoring:
+    post:
+      tags: [Tailoring]
+      operationId: createTailoring
+      summary: Start a tailoring job (resume + job description -> LLM)
+      description: |
+        Requires explicit `consent: true` — this is the consent flag/timestamp
+        required before resume content is sent to the LLM API. The job is
+        always created (and its status is always resolved to `completed` or
+        `failed`, never left `pending`) before this endpoint responds; a
+        failed LLM call still returns `201` with `status: "failed"` and a
+        `failureReason`, not an HTTP error.
+
+        Subject to a **per-user daily quota** (default 20/day) separate from
+        the general rate limits, since this is the only LLM-calling endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTailoringRequest' }
+      responses:
+        '201':
+          description: Tailoring job created (check `status` for outcome)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TailoringResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The resume or job description belongs to another user (`RESUME_FORBIDDEN` / `JOB_DESCRIPTION_FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Resume or job description not found (`RESUME_NOT_FOUND` / `JOB_DESCRIPTION_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Daily tailoring quota exceeded (`LLM_DAILY_QUOTA_EXCEEDED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tailoring/{id}:
+    get:
+      tags: [Tailoring]
+      operationId: getTailoring
+      summary: Get a tailoring result (diffs, ATS scores, unmatched requirements)
+      parameters:
+        - $ref: '#/components/parameters/TailoringId'
+      responses:
+        '200':
+          description: The tailoring result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TailoringResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: This tailoring result belongs to another user (`TAILORING_FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Tailoring result not found (`TAILORING_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tailoring/{id}/accept:
+    post:
+      tags: [Tailoring]
+      operationId: acceptTailoring
+      summary: Accept a set of suggested changes to produce a final version
+      description: |
+        Only bulletIds whose diff status is `modified` are ever applied —
+        a `flagged_invented` bulletId is silently ignored even if explicitly
+        requested, so a client can never reintroduce content the guardrail
+        already rejected. Omitted/unaccepted bullets keep their original text.
+      parameters:
+        - $ref: '#/components/parameters/TailoringId'
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptTailoringRequest' }
+      responses:
+        '200':
+          description: Tailoring result with `finalSections`/`acceptedBulletIds`/`acceptedAt` populated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TailoringResult' }
+        '400':
+          description: |
+            Validation error, or the job isn't `completed` yet
+            (`TAILORING_NOT_COMPLETED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: This tailoring result belongs to another user (`TAILORING_FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Tailoring result not found (`TAILORING_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tailoring/{id}/export:
+    get:
+      tags: [Tailoring]
+      operationId: exportTailoring
+      summary: Export the tailored resume as a PDF or DOCX file
+      description: |
+        Exports the accepted `finalSections` if `POST /tailoring/{id}/accept`
+        has been called, otherwise the raw `tailoredSections`. Generates a
+        clean, single-column, ATS-friendly layout — it does not attempt to
+        recreate the original uploaded file's visual design.
+      parameters:
+        - $ref: '#/components/parameters/TailoringId'
+        - name: format
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [pdf, docx]
+      responses:
+        '200':
+          description: The generated resume file
+          headers:
+            Content-Disposition:
+              schema: { type: string, example: 'attachment; filename="resume.pdf"' }
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema: { type: string, format: binary }
+        '400':
+          description: |
+            Validation error, or the job has no exportable content yet
+            (`TAILORING_NOT_EXPORTABLE`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: This tailoring result belongs to another user (`TAILORING_FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Tailoring result not found (`TAILORING_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /history:
+    get:
+      tags: [History]
+      operationId: getHistory
+      summary: List the user's past tailoring jobs, newest first
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: A page of tailoring history
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoryPage' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ResumeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TailoringId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or expired access token (`AUTH_UNAUTHORIZED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Request failed schema validation (`VALIDATION_ERROR`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { type: string, example: RESUME_NOT_FOUND }
+            message: { type: string }
+            details: { type: object }
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 72 }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+
+    AuthUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+
+    TokenPair:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+
+    AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          properties:
+            user: { $ref: '#/components/schemas/AuthUser' }
+
+    ParsedContact:
+      type: object
+      properties:
+        name: { type: string, nullable: true }
+        email: { type: string, format: email, nullable: true }
+        phone: { type: string, nullable: true }
+        location: { type: string, nullable: true }
+
+    ExperienceEntry:
+      type: object
+      required: [bullets]
+      properties:
+        company: { type: string, nullable: true }
+        title: { type: string, nullable: true }
+        startDate: { type: string, nullable: true }
+        endDate: { type: string, nullable: true }
+        bullets: { type: array, items: { type: string } }
+
+    EducationEntry:
+      type: object
+      properties:
+        institution: { type: string, nullable: true }
+        degree: { type: string, nullable: true }
+        startDate: { type: string, nullable: true }
+        endDate: { type: string, nullable: true }
+
+    ResumeSections:
+      type: object
+      description: Shared shape for a resume's tailorable content (used for originalSections/tailoredSections/finalSections)
+      properties:
+        parsedContact: { $ref: '#/components/schemas/ParsedContact' }
+        summary: { type: string }
+        experience:
+          type: array
+          items: { $ref: '#/components/schemas/ExperienceEntry' }
+        education:
+          type: array
+          items: { $ref: '#/components/schemas/EducationEntry' }
+        skills:
+          type: array
+          items: { type: string }
+
+    Resume:
+      allOf:
+        - $ref: '#/components/schemas/ResumeSections'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            userId: { type: string, format: uuid }
+            rawFileUrl: { type: string, description: 'Internal storage path (not directly downloadable)' }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+
+    PatchResumeRequest:
+      type: object
+      description: At least one field is required.
+      minProperties: 1
+      properties:
+        parsedContact: { $ref: '#/components/schemas/ParsedContact' }
+        summary: { type: string }
+        experience:
+          type: array
+          items: { $ref: '#/components/schemas/ExperienceEntry' }
+        education:
+          type: array
+          items: { $ref: '#/components/schemas/EducationEntry' }
+        skills:
+          type: array
+          items: { type: string }
+
+    CreateJobDescriptionRequest:
+      type: object
+      required: [rawText]
+      properties:
+        rawText: { type: string, minLength: 1, maxLength: 20000 }
+
+    JobDescription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        rawText: { type: string }
+        keywords: { type: array, items: { type: string } }
+        requirements: { type: array, items: { type: string } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateTailoringRequest:
+      type: object
+      required: [resumeId, jobDescriptionId, consent]
+      properties:
+        resumeId: { type: string, format: uuid }
+        jobDescriptionId: { type: string, format: uuid }
+        consent:
+          type: boolean
+          enum: [true]
+          description: Must be `true` — explicit consent to send resume content to the LLM API.
+
+    AcceptTailoringRequest:
+      type: object
+      properties:
+        acceptedBulletIds:
+          type: array
+          items: { type: string }
+          default: []
+          description: >
+            bulletIds (e.g. "summary", "skills", "experience-0-bullet-1") from
+            `perBulletDiffs` to apply. Only ids whose diff status is
+            "modified" ever take effect.
+
+    BulletDiff:
+      type: object
+      properties:
+        sectionId: { type: string, example: experience-0 }
+        bulletId: { type: string, example: experience-0-bullet-1 }
+        original: { type: string }
+        suggested: { type: string }
+        status:
+          type: string
+          enum: [unchanged, modified, flagged_invented]
+          description: >
+            `flagged_invented` means the guardrail found unverifiable content
+            in the suggestion and reverted it — `suggested` shows what the
+            LLM proposed, but it was never applied.
+
+    TailoringResult:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        resumeId: { type: string, format: uuid }
+        jobDescriptionId: { type: string, format: uuid }
+        originalSections: { $ref: '#/components/schemas/ResumeSections' }
+        tailoredSections:
+          type: object
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/ResumeSections' }]
+          description: Null until the job completes.
+        perBulletDiffs:
+          type: array
+          items: { $ref: '#/components/schemas/BulletDiff' }
+        atsScoreBefore: { type: number, description: 'Keyword-coverage score 0-100, computed before tailoring' }
+        atsScoreAfter: { type: number, nullable: true, description: 'Null until the job completes' }
+        unmatchedRequirements:
+          type: array
+          items: { type: string }
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        failureReason: { type: string, nullable: true }
+        consentGivenAt: { type: string, format: date-time }
+        finalSections:
+          type: object
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/ResumeSections' }]
+          description: Set once `POST /tailoring/{id}/accept` has been called.
+        acceptedBulletIds:
+          type: array
+          items: { type: string }
+        acceptedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    HistoryItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        atsScoreBefore: { type: number }
+        atsScoreAfter: { type: number, nullable: true }
+        unmatchedRequirements:
+          type: array
+          items: { type: string }
+        createdAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time, nullable: true }
+        resume:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string, nullable: true }
+        jobDescription:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            excerpt: { type: string, description: First 120 characters of the raw job description text }
+            keywords: { type: array, items: { type: string } }
+
+    HistoryPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryItem' }
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }

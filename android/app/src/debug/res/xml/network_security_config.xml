@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-only: Android blocks plain HTTP (cleartext) traffic by default since
+  API 28. The local dev backend isn't served over HTTPS, so without this,
+  every request from a debug build to the dev server would be blocked by the
+  OS itself. This file lives under src/debug, so it's never merged into
+  release — release builds stay HTTPS-only, matching the platform default.
+
+  A base-config (any host), not a domain-scoped one: the dev backend gets
+  addressed differently depending on where the app runs from: 10.0.2.2 on
+  the Android emulator, localhost on desktop/web, and a LAN IP (192.168.x.x,
+  set via the API_HOST dart-define) on a physical device, which changes with
+  whatever network the dev machine is on. Pinning exact hosts here would need
+  updating every time that changes; since this is debug-only, a blanket
+  allowance is the standard, low-risk trade-off.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
